@@ -6,8 +6,9 @@ import android.graphics.*
 import android.os.Bundle
 import android.widget.FrameLayout
 import android.widget.ImageView
+import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
+import androidx.activity.ComponentActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
@@ -18,7 +19,7 @@ import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import java.util.concurrent.Executors
 import kotlin.math.hypot
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : ComponentActivity() {
 
     external fun applyFilters(bmp: Bitmap, screenFilter: Int, portalFilter: Int, quad: FloatArray?)
 
@@ -28,7 +29,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private lateinit var imageView: ImageView
-    private lateinit var landmarker: HandLandmarker
+    private var landmarker: HandLandmarker? = null
     private val exec = Executors.newSingleThreadExecutor()
 
     // state
@@ -54,14 +55,22 @@ class MainActivity : AppCompatActivity() {
         imageView = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setBackgroundColor(Color.BLACK) }
         setContentView(FrameLayout(this).apply { addView(imageView) })
 
-        landmarker = HandLandmarker.createFromOptions(
-            this,
-            HandLandmarker.HandLandmarkerOptions.builder()
-                .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build())
-                .setNumHands(2)
-                .setRunningMode(RunningMode.IMAGE)
-                .build()
-        )
+        try {
+            landmarker = HandLandmarker.createFromOptions(
+                this,
+                HandLandmarker.HandLandmarkerOptions.builder()
+                    .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build())
+                    .setNumHands(2)
+                    .setRunningMode(RunningMode.IMAGE)
+                    .build()
+            )
+        } catch (e: Throwable) {
+            setContentView(TextView(this).apply {
+                setTextColor(Color.WHITE); setBackgroundColor(Color.BLACK); setPadding(40, 80, 40, 40)
+                text = "Gagal load model:\n${e}"
+            })
+            return
+        }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
             startCamera() else permLauncher.launch(Manifest.permission.CAMERA)
@@ -92,7 +101,7 @@ class MainActivity : AppCompatActivity() {
         proxy.close()
 
         val w = bmp.width.toFloat(); val h = bmp.height.toFloat()
-        val result = landmarker.detect(BitmapImageBuilder(bmp).build())
+        val result = landmarker!!.detect(BitmapImageBuilder(bmp).build())
         // hands as pixel-space points, sorted left-to-right on screen
         val hands = result.landmarks()
             .map { lm -> lm.map { PointF(it.x() * w, it.y() * h) } }
