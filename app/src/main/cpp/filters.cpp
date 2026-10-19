@@ -1,9 +1,11 @@
 // RetroLens native filters (C++ / NDK)
-// Filter ids: 0 = none, 1 = CYBER_NEON, 2 = SEPIA, 3 = NEGATIVE
+// Filter ids: 0 = none, 1 = CYBER_NEON, 2 = SEPIA, 3 = NEGATIVE,
+//               4 = THERMAL, 5 = NOIR, 6 = MATRIX, 7 = SUNSET
 #include <jni.h>
 #include <android/bitmap.h>
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
 
 static inline uint8_t clamp8(float v) { return v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v); }
 
@@ -25,6 +27,31 @@ static inline void applyOne(uint8_t* p, int f) {
             p[0] = 255 - p[0];
             p[1] = 255 - p[1];
             p[2] = 255 - p[2];
+            break;
+        case 4: {  // thermal camera: luminance -> heat map
+            float t = l / 255.0f;
+            float rr = 1.5f - std::fabs(4.0f * t - 3.0f);
+            float gg = 1.5f - std::fabs(4.0f * t - 2.0f);
+            float bb = 1.5f - std::fabs(4.0f * t - 1.0f);
+            p[0] = clamp8(255.0f * std::min(1.0f, std::max(0.0f, rr)));
+            p[1] = clamp8(255.0f * std::min(1.0f, std::max(0.0f, gg)));
+            p[2] = clamp8(255.0f * std::min(1.0f, std::max(0.0f, bb)));
+            break;
+        }
+        case 5: {  // noir: high-contrast black & white
+            uint8_t v = clamp8((l - 128.0f) * 1.4f + 128.0f);
+            p[0] = p[1] = p[2] = v;
+            break;
+        }
+        case 6:  // matrix: green terminal
+            p[0] = clamp8(0.10f * l);
+            p[1] = clamp8(1.20f * l + 10);
+            p[2] = clamp8(0.15f * l);
+            break;
+        case 7:  // sunset: warm orange/pink
+            p[0] = clamp8(0.90f * r + 0.40f * l + 30);
+            p[1] = clamp8(0.55f * g + 0.15f * l);
+            p[2] = clamp8(0.50f * b + 0.20f * l + 20);
             break;
         default: break;
     }
@@ -70,9 +97,16 @@ Java_com_retrolens_app_MainActivity_applyFilters(JNIEnv* env, jobject, jobject b
     // matches the screen filter (this gives the "portal" inversion effect).
     int inside = (portalFilter == screenFilter) ? 0 : portalFilter;
 
-    for (uint32_t y = 0; y < info.height; y++) {
+    if (screenFilter == 0 && !hasQuad) { AndroidBitmap_unlockPixels(env, bitmap); return; }
+    uint32_t y0i = 0, y1i = info.height, x0i = 0, x1i = info.width;
+    if (screenFilter == 0 && hasQuad) {  // nothing outside the portal to do
+        if (maxX < minX || maxY < minY) { AndroidBitmap_unlockPixels(env, bitmap); return; }
+        y0i = (uint32_t)minY; y1i = (uint32_t)maxY + 1; x0i = (uint32_t)minX; x1i = (uint32_t)maxX + 1;
+    }
+
+    for (uint32_t y = y0i; y < y1i; y++) {
         uint8_t* row = (uint8_t*)pixels + y * info.stride;
-        for (uint32_t x = 0; x < info.width; x++) {
+        for (uint32_t x = x0i; x < x1i; x++) {
             int f = screenFilter;
             if (hasQuad && (int)x >= minX && (int)x <= maxX && (int)y >= minY && (int)y <= maxY &&
                 insideQuad(q, (float)x, (float)y))
