@@ -41,6 +41,16 @@ class MainActivity : ComponentActivity() {
     private var msgUntil = 0L
     private var lastFrame = System.nanoTime()
     private var fps = 0f
+    private var lastTs = 0L
+    private var lastSlingAt = 0L
+    private var lastSlingLine: Pair<PointF, PointF>? = null
+    private var errView: TextView? = null
+
+    private fun nextTs(): Long {
+        val t = System.nanoTime() / 1_000_000
+        lastTs = if (t > lastTs) t else lastTs + 1
+        return lastTs
+    }
 
     private val green = Paint().apply { color = Color.rgb(60, 255, 60); strokeWidth = 6f; style = Paint.Style.STROKE; isAntiAlias = true }
     private val dot = Paint().apply { color = Color.rgb(60, 255, 60); style = Paint.Style.FILL; isAntiAlias = true }
@@ -53,7 +63,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         imageView = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setBackgroundColor(Color.BLACK) }
-        setContentView(FrameLayout(this).apply { addView(imageView) })
+        val root = FrameLayout(this)
+        root.addView(imageView)
+        errView = TextView(this).apply { setTextColor(Color.RED); textSize = 13f; setPadding(20, 140, 20, 0) }
+        root.addView(errView)
+        setContentView(root)
 
         try {
             landmarker = HandLandmarker.createFromOptions(
@@ -61,7 +75,10 @@ class MainActivity : ComponentActivity() {
                 HandLandmarker.HandLandmarkerOptions.builder()
                     .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build())
                     .setNumHands(2)
-                    .setRunningMode(RunningMode.IMAGE)
+                    .setMinHandDetectionConfidence(0.4f)
+                    .setMinHandPresenceConfidence(0.4f)
+                    .setMinTrackingConfidence(0.4f)
+                    .setRunningMode(RunningMode.VIDEO)
                     .build()
             )
         } catch (e: Throwable) {
@@ -91,6 +108,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun processFrame(proxy: ImageProxy) {
+        try {
+            processFrameInner(proxy)
+        } catch (e: Throwable) {
+            runCatching { proxy.close() }
+            android.util.Log.e("RetroLens", "frame error", e)
+            runOnUiThread { errView?.text = "ERR: $e" }
+        }
+    }
+
+    private fun processFrameInner(proxy: ImageProxy) {
         val raw = proxy.toBitmap()
         val m = Matrix().apply {
             postRotate(proxy.imageInfo.rotationDegrees.toFloat())
@@ -101,7 +128,7 @@ class MainActivity : ComponentActivity() {
         proxy.close()
 
         val w = bmp.width.toFloat(); val h = bmp.height.toFloat()
-        val result = landmarker!!.detect(BitmapImageBuilder(bmp).build())
+        val result = landmarker!!.detectForVideo(BitmapImageBuilder(bmp).build(), nextTs())
         // hands as pixel-space points, sorted left-to-right on screen
         val hands = result.landmarks()
             .map { lm -> lm.map { PointF(it.x() * w, it.y() * h) } }
@@ -119,7 +146,9 @@ class MainActivity : ComponentActivity() {
             if (leftPeace && rightPinch) {
                 sling = true
                 line = Pair(l[8], r[4])
-                note("KETAPEL [${NAMES[portalFilter]}] - LEPAS CUBITAN UNTUK TEMBAK!", 300)
+                lastSlingAt = now
+                lastSlingLine = line
+                note("KETAPEL [${NAMES[portalFilter]}] - LEPAS CUBITAN UNTUK TEMBAK!", 400)
             } else if (isPinch(l) && rightPinch) {
                 line = Pair(l[4], r[4])
                 if (now - lastSwitch > 1000) {
@@ -135,6 +164,9 @@ class MainActivity : ComponentActivity() {
             screenFilter = 0
             note("RESET - filter layar dimatikan", 1200)
         }
+
+        // tolerate brief detection drop-outs so the line doesn't flicker / misfire
+        if (!sling && wasSling && now - lastSlingAt < 350) { sling = true; line = lastSlingLine }
 
         // slingshot released -> whole screen takes the portal filter
         if (wasSling && !sling) {
@@ -172,7 +204,7 @@ class MainActivity : ComponentActivity() {
     // ---- gesture helpers (landmark indices from MediaPipe Hands) ----
     private fun d(a: PointF, b: PointF) = hypot(a.x - b.x, a.y - b.y)
     private fun size(h: List<PointF>) = d(h[0], h[9])
-    private fun isPinch(h: List<PointF>) = d(h[4], h[8]) / size(h) < 0.35f
+    private fun isPinch(h: List<PointF>) = d(h[4], h[8]) / size(h) < 0.4f
     private fun up(h: List<PointF>, tip: Int, pip: Int) = d(h[0], h[tip]) > d(h[0], h[pip]) * 1.15f
     private fun isPeace(h: List<PointF>) = up(h, 8, 6) && up(h, 12, 10) && !up(h, 16, 14) && !up(h, 20, 18)
     private fun isOpenPalm(h: List<PointF>) = up(h, 8, 6) && up(h, 12, 10) && up(h, 16, 14) && up(h, 20, 18)
