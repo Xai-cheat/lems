@@ -4,18 +4,23 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.os.Bundle
+import android.util.Log
+import android.util.Size
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import java.util.concurrent.Executors
 import kotlin.math.hypot
 
@@ -25,32 +30,47 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         init { System.loadLibrary("retrolens") }
-        val NAMES = arrayOf("NONE", "CYBER_NEON", "SEPIA", "NEGATIVE")
+        val NAMES = arrayOf("NONE", "CYBER_NEON", "SEPIA", "NEGATIVE", "THERMAL", "NOIR", "MATRIX", "SUNSET")
     }
 
     private lateinit var imageView: ImageView
-    private var landmarker: HandLandmarker? = null
-    private val exec = Executors.newSingleThreadExecutor()
-
-    // state
-    private var screenFilter = 0
-    private var portalFilter = 1
-    private var lastSwitch = 0L
-    private var wasSling = false
-    private var msg = ""
-    private var msgUntil = 0L
-    private var lastFrame = System.nanoTime()
-    private var fps = 0f
-    private var lastTs = 0L
-    private var lastSlingAt = 0L
-    private var lastSlingLine: Pair<PointF, PointF>? = null
+    @Volatile private var landmarker: HandLandmarker? = null
+    @Volatile private var usingGpu = false
+    @Volatile private var switching = false
     private var errView: TextView? = null
 
-    private fun nextTs(): Long {
-        val t = System.nanoTime() / 1_000_000
-        lastTs = if (t > lastTs) t else lastTs + 1
-        return lastTs
-    }
+    private val exec = Executors.newSingleThreadExecutor()   // camera frames -> drawing
+
+    // reusable output buffers (no per-frame allocation = no GC stutter)
+    private val ring = arrayOfNulls<Bitmap>(3)
+    private var ringIdx = 0
+
+    // frame size, written by the drawing thread, read by the result callback
+    @Volatile private var frameW = 0f
+    @Volatile private var frameH = 0f
+
+    // gesture state: written by MediaPipe's result callback, read by the drawing thread
+    @Volatile private var screenFilter = 0
+    @Volatile private var portalFilter = 1
+    @Volatile private var quad: FloatArray? = null
+    @Volatile private var line: Pair<PointF, PointF>? = null
+    @Volatile private var handsPx: List<List<PointF>> = emptyList()
+    @Volatile private var msg = ""
+    @Volatile private var msgUntil = 0L
+
+    // result-callback only
+    private var lastSwitch = 0L
+    private var wasSling = false
+    private var lastSlingAt = 0L
+    private var lastSlingLine: Pair<PointF, PointF>? = null
+    private var prevQuad: FloatArray? = null
+
+    // drawing-thread only
+    private var lastTs = 0L
+    private var lastDetSent = 0L
+    private var dispQuad: FloatArray? = null
+    private var dispLine: FloatArray? = null
+    private var dispDots: FloatArray? = null
 
     private val green = Paint().apply { color = Color.rgb(60, 255, 60); strokeWidth = 6f; style = Paint.Style.STROKE; isAntiAlias = true }
     private val dot = Paint().apply { color = Color.rgb(60, 255, 60); style = Paint.Style.FILL; isAntiAlias = true }
@@ -69,28 +89,67 @@ class MainActivity : ComponentActivity() {
         root.addView(errView)
         setContentView(root)
 
-        try {
-            landmarker = HandLandmarker.createFromOptions(
-                this,
-                HandLandmarker.HandLandmarkerOptions.builder()
-                    .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build())
-                    .setNumHands(2)
-                    .setMinHandDetectionConfidence(0.4f)
-                    .setMinHandPresenceConfidence(0.4f)
-                    .setMinTrackingConfidence(0.4f)
-                    .setRunningMode(RunningMode.VIDEO)
-                    .build()
-            )
-        } catch (e: Throwable) {
-            setContentView(TextView(this).apply {
-                setTextColor(Color.WHITE); setBackgroundColor(Color.BLACK); setPadding(40, 80, 40, 40)
-                text = "Gagal load model:\n${e}"
-            })
-            return
+        // try the GPU first (much faster); fall back to CPU if this phone can't do it
+        landmarker = try {
+            usingGpu = true
+            buildLandmarker(true)
+        } catch (t: Throwable) {
+            usingGpu = false
+            try {
+                buildLandmarker(false)
+            } catch (e: Throwable) {
+                setContentView(TextView(this).apply {
+                    setTextColor(Color.WHITE); setBackgroundColor(Color.BLACK); setPadding(40, 80, 40, 40)
+                    text = "Gagal load model:\n${e}"
+                })
+                return
+            }
         }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
             startCamera() else permLauncher.launch(Manifest.permission.CAMERA)
+    }
+
+    private fun buildLandmarker(gpu: Boolean): HandLandmarker {
+        val base = BaseOptions.builder().setModelAssetPath("hand_landmarker.task")
+        if (gpu) base.setDelegate(Delegate.GPU)
+        return HandLandmarker.createFromOptions(
+            this,
+            HandLandmarker.HandLandmarkerOptions.builder()
+                .setBaseOptions(base.build())
+                .setNumHands(2)
+                .setMinHandDetectionConfidence(0.4f)
+                .setMinHandPresenceConfidence(0.4f)
+                .setMinTrackingConfidence(0.4f)
+                .setRunningMode(RunningMode.LIVE_STREAM)
+                .setResultListener { result: HandLandmarkerResult, _: MPImage -> onResult(result) }
+                .setErrorListener { e: RuntimeException -> onMpError(e) }
+                .build()
+        )
+    }
+
+    private fun onMpError(e: RuntimeException) {
+        Log.e("RetroLens", "mediapipe error", e)
+        if (usingGpu && !switching) {
+            switching = true
+            runOnUiThread { switchToCpu() }
+        } else {
+            runOnUiThread { errView?.text = "ERR: $e" }
+        }
+    }
+
+    private fun switchToCpu() {
+        val old = landmarker
+        landmarker = null
+        try { old?.close() } catch (_: Throwable) {}
+        usingGpu = false
+        landmarker = try {
+            buildLandmarker(false)
+        } catch (t: Throwable) {
+            errView?.text = "ERR: $t"
+            null
+        }
+        errView?.text = ""
     }
 
     private fun startCamera() {
@@ -98,6 +157,7 @@ class MainActivity : ComponentActivity() {
         future.addListener({
             val provider = future.get()
             val analysis = ImageAnalysis.Builder()
+                .setTargetResolution(Size(480, 640))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
@@ -107,96 +167,160 @@ class MainActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    private fun nextBuffer(w: Int, h: Int): Bitmap {
+        ringIdx = (ringIdx + 1) % ring.size
+        var b = ring[ringIdx]
+        if (b == null || b.width != w || b.height != h) {
+            b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            ring[ringIdx] = b
+        }
+        return b!!
+    }
+
+    private fun nextTs(): Long {
+        val t = System.nanoTime() / 1_000_000
+        lastTs = if (t > lastTs) t else lastTs + 1
+        return lastTs
+    }
+
+    // ---------- drawing thread: runs on every camera frame, never waits for detection ----------
     private fun processFrame(proxy: ImageProxy) {
         try {
-            processFrameInner(proxy)
+            val raw = proxy.toBitmap()
+            val rot = proxy.imageInfo.rotationDegrees
+            proxy.close()
+
+            val swap = rot == 90 || rot == 270
+            val ow = if (swap) raw.height else raw.width
+            val oh = if (swap) raw.width else raw.height
+            val bmp = nextBuffer(ow, oh)
+
+            // rotate upright + mirror (selfie view), drawn straight into the reusable buffer
+            val m = Matrix().apply {
+                postTranslate(-raw.width / 2f, -raw.height / 2f)
+                postRotate(rot.toFloat())
+                postScale(-1f, 1f)
+                postTranslate(ow / 2f, oh / 2f)
+            }
+            val c = Canvas(bmp)
+            c.drawBitmap(raw, m, null)
+
+            val w = bmp.width.toFloat(); val h = bmp.height.toFloat()
+            frameW = w; frameH = h
+
+            // hand the frame to MediaPipe (it runs in the background and skips frames if busy)
+            val lm = landmarker
+            val nowMs = System.currentTimeMillis()
+            if (lm != null && !switching && nowMs - lastDetSent >= 40) {
+                lastDetSent = nowMs
+                val small = Bitmap.createScaledBitmap(bmp, bmp.width / 2, bmp.height / 2, true)
+                lm.detectAsync(BitmapImageBuilder(small).build(), nextTs())
+            }
+
+            // glide the overlay toward the newest detection so it moves smoothly
+            val tq = quad
+            val dq = dispQuad
+            val q = if (tq != null && dq != null) FloatArray(8) { dq[it] + (tq[it] - dq[it]) * 0.45f } else tq
+            dispQuad = q
+            val tl = line?.let { floatArrayOf(it.first.x, it.first.y, it.second.x, it.second.y) }
+            val dl = dispLine
+            val ln = if (tl != null && dl != null) FloatArray(4) { dl[it] + (tl[it] - dl[it]) * 0.45f } else tl
+            dispLine = ln
+            val hs = handsPx
+
+            applyFilters(bmp, screenFilter, portalFilter, q)
+
+            q?.let {
+                val p = Path().apply { moveTo(it[0], it[1]); lineTo(it[2], it[3]); lineTo(it[4], it[5]); lineTo(it[6], it[7]); close() }
+                c.drawPath(p, green)
+                c.drawText("PORTAL: ${NAMES[portalFilter]}", it[2], minOf(it[3], it[5]) - 20, text)
+            }
+            ln?.let { c.drawLine(it[0], it[1], it[2], it[3], green) }
+            val td = FloatArray(hs.size * 4)
+            hs.forEachIndexed { k, hd -> td[k * 4] = hd[4].x; td[k * 4 + 1] = hd[4].y; td[k * 4 + 2] = hd[8].x; td[k * 4 + 3] = hd[8].y }
+            val pd = dispDots
+            val dd = if (pd != null && pd.size == td.size) FloatArray(td.size) { pd[it] + (td[it] - pd[it]) * 0.5f } else td
+            dispDots = dd
+            for (k in 0 until dd.size / 4) {
+                c.drawCircle(dd[k * 4], dd[k * 4 + 1], 10f, dot)
+                c.drawCircle(dd[k * 4 + 2], dd[k * 4 + 3], 10f, dot)
+            }
+
+            if (System.currentTimeMillis() < msgUntil) c.drawText(msg, 20f, h - 120f, text)
+
+            runOnUiThread { imageView.setImageBitmap(bmp) }
         } catch (e: Throwable) {
             runCatching { proxy.close() }
-            android.util.Log.e("RetroLens", "frame error", e)
-            runOnUiThread { errView?.text = "ERR: $e" }
+            Log.e("RetroLens", "frame error", e)
+            if (!switching) runOnUiThread { errView?.text = "ERR: $e" }
         }
     }
 
-    private fun processFrameInner(proxy: ImageProxy) {
-        val raw = proxy.toBitmap()
-        val m = Matrix().apply {
-            postRotate(proxy.imageInfo.rotationDegrees.toFloat())
-            postScale(-1f, 1f)  // mirror like a selfie view
-        }
-        val bmp = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true)
-            .copy(Bitmap.Config.ARGB_8888, true)
-        proxy.close()
+    // ---------- MediaPipe result callback: decides gestures ----------
+    private fun smoothQuad(n: FloatArray?): FloatArray? {
+        val p = prevQuad
+        val out = if (n != null && p != null) FloatArray(8) { 0.4f * p[it] + 0.6f * n[it] } else n
+        prevQuad = out
+        return out
+    }
 
-        val w = bmp.width.toFloat(); val h = bmp.height.toFloat()
-        val result = landmarker!!.detectForVideo(BitmapImageBuilder(bmp).build(), nextTs())
-        // hands as pixel-space points, sorted left-to-right on screen
-        val hands = result.landmarks()
-            .map { lm -> lm.map { PointF(it.x() * w, it.y() * h) } }
-            .sortedBy { it[0].x }
+    private fun onResult(result: HandLandmarkerResult) {
+        try {
+            val w = frameW; val h = frameH
+            if (w == 0f || h == 0f) return
 
-        val now = System.currentTimeMillis()
-        var quad: FloatArray? = null
-        var line: Pair<PointF, PointF>? = null
-        var sling = false
+            // hands as pixel-space points, sorted left-to-right on screen
+            val hands = result.landmarks()
+                .map { lm -> lm.map { PointF(it.x() * w, it.y() * h) } }
+                .sortedBy { it[0].x }
 
-        if (hands.size == 2) {
-            val l = hands[0]; val r = hands[1]
-            val leftPeace = isPeace(l)
-            val rightPinch = isPinch(r)
-            if (leftPeace && rightPinch) {
-                sling = true
-                line = Pair(l[8], r[4])
-                lastSlingAt = now
-                lastSlingLine = line
-                note("KETAPEL [${NAMES[portalFilter]}] - LEPAS CUBITAN UNTUK TEMBAK!", 400)
-            } else if (isPinch(l) && rightPinch) {
-                line = Pair(l[4], r[4])
-                if (now - lastSwitch > 1000) {
-                    lastSwitch = now
-                    portalFilter = portalFilter % 3 + 1
-                    note("PORTAL: ${NAMES[portalFilter]}", 1000)
+            val now = System.currentTimeMillis()
+            var newQuad: FloatArray? = null
+            var newLine: Pair<PointF, PointF>? = null
+            var sling = false
+
+            if (hands.size == 2) {
+                val l = hands[0]; val r = hands[1]
+                val leftPeace = isPeace(l)
+                val rightPinch = isPinch(r)
+                if (leftPeace && rightPinch) {
+                    sling = true
+                    newLine = Pair(l[8], r[4])
+                    lastSlingAt = now
+                    lastSlingLine = newLine
+                    note("KETAPEL [${NAMES[portalFilter]}] - LEPAS CUBITAN UNTUK TEMBAK!", 400)
+                } else if (isPinch(l) && rightPinch) {
+                    newLine = Pair(l[4], r[4])
+                    if (now - lastSwitch > 1000) {
+                        lastSwitch = now
+                        portalFilter = portalFilter % (NAMES.size - 1) + 1
+                        note("PORTAL: ${NAMES[portalFilter]}", 1000)
+                    }
+                } else {
+                    // portal = frame made by both hands (thumb + index tips)
+                    newQuad = floatArrayOf(l[4].x, l[4].y, l[8].x, l[8].y, r[8].x, r[8].y, r[4].x, r[4].y)
                 }
-            } else {
-                // portal = frame made by both hands (thumb + index tips)
-                quad = floatArrayOf(l[4].x, l[4].y, l[8].x, l[8].y, r[8].x, r[8].y, r[4].x, r[4].y)
+            } else if (hands.size == 1 && isOpenPalm(hands[0]) && screenFilter != 0) {
+                screenFilter = 0
+                note("RESET - filter layar dimatikan", 1200)
             }
-        } else if (hands.size == 1 && isOpenPalm(hands[0]) && screenFilter != 0) {
-            screenFilter = 0
-            note("RESET - filter layar dimatikan", 1200)
+
+            // tolerate brief detection drop-outs so the line doesn't flicker / misfire
+            if (!sling && wasSling && now - lastSlingAt < 350) { sling = true; newLine = lastSlingLine }
+
+            // slingshot released -> whole screen takes the portal filter
+            if (wasSling && !sling) {
+                screenFilter = portalFilter
+                note("KETAPEL DITEMBAK! Layar: ${NAMES[screenFilter]}", 1500)
+            }
+            wasSling = sling
+
+            quad = smoothQuad(newQuad)
+            line = newLine
+            handsPx = hands
+        } catch (e: Throwable) {
+            Log.e("RetroLens", "result error", e)
         }
-
-        // tolerate brief detection drop-outs so the line doesn't flicker / misfire
-        if (!sling && wasSling && now - lastSlingAt < 350) { sling = true; line = lastSlingLine }
-
-        // slingshot released -> whole screen takes the portal filter
-        if (wasSling && !sling) {
-            screenFilter = portalFilter
-            note("KETAPEL DITEMBAK! Layar: ${NAMES[screenFilter]}", 1500)
-        }
-        wasSling = sling
-
-        applyFilters(bmp, screenFilter, portalFilter, quad)
-
-        // overlay
-        val c = Canvas(bmp)
-        quad?.let {
-            val p = Path().apply { moveTo(it[0], it[1]); lineTo(it[2], it[3]); lineTo(it[4], it[5]); lineTo(it[6], it[7]); close() }
-            c.drawPath(p, green)
-            c.drawText("PORTAL: ${NAMES[portalFilter]}", it[2], minOf(it[3], it[5]) - 20, text)
-        }
-        line?.let { c.drawLine(it.first.x, it.first.y, it.second.x, it.second.y, green) }
-        hands.forEach { hd -> intArrayOf(4, 8).forEach { i -> c.drawCircle(hd[i].x, hd[i].y, 10f, dot) } }
-
-        val t = System.nanoTime(); fps = 0.9f * fps + 0.1f * (1e9f / (t - lastFrame)); lastFrame = t
-        c.drawText("RETROLENS AR SYSTEM", 20f, 60f, text)
-        c.drawText("Filter Layar: ${NAMES[screenFilter]}", 20f, 105f, text)
-        c.drawText("FPS: %.1f".format(fps), 20f, 150f, text)
-        if (now < msgUntil) c.drawText(msg, 20f, h - 120f, text)
-        text.textSize = 28f
-        c.drawText("2 Tangan = PORTAL | 2x Cubit = GANTI | Peace+Cubit = KETAPEL | 1 Telapak = RESET", 20f, h - 50f, text)
-        text.textSize = 38f
-
-        runOnUiThread { imageView.setImageBitmap(bmp) }
     }
 
     private fun note(s: String, ms: Long) { msg = s; msgUntil = System.currentTimeMillis() + ms }
