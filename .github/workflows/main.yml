@@ -19,7 +19,8 @@ jobs:
 
       - name: Download MediaPipe hand model
         run: |
-          curl -L -o app/src/main/assets/hand_landmarker.task \
+          mkdir -p app/src/main/assets
+          curl -fL --retry 3 -o app/src/main/assets/hand_landmarker.task \
             https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
 
       - name: Build debug APK (compiles C++ via NDK too)
@@ -29,4 +30,3 @@ jobs:
         with:
           name: retrolens-apk
           path: app/build/outputs/apk/debug/*.apk
-          
