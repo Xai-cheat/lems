@@ -1,11 +1,14 @@
 // RetroLens native filters (C++ / NDK)
 // Filter ids: 0 = none, 1 = CYBER_NEON, 2 = SEPIA, 3 = NEGATIVE,
-//               4 = THERMAL, 5 = NOIR, 6 = MATRIX, 7 = SUNSET
+//               4 = THERMAL, 5 = NOIR, 6 = MATRIX, 7 = SUNSET,
+//               8 = COMIC, 9 = ICE, 10 = VAPOR, 11 = GOLD, 12 = TOXIC
 #include <jni.h>
 #include <android/bitmap.h>
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
+#include <thread>
+#include <vector>
 
 static inline uint8_t clamp8(float v) { return v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v); }
 
@@ -52,6 +55,36 @@ static inline void applyOne(uint8_t* p, int f) {
             p[0] = clamp8(0.90f * r + 0.40f * l + 30);
             p[1] = clamp8(0.55f * g + 0.15f * l);
             p[2] = clamp8(0.50f * b + 0.20f * l + 20);
+            break;
+        case 8: {  // comic: posterized, extra-saturated colors
+            float sat = 1.6f;
+            float rr = l + (r - l) * sat, gg = l + (g - l) * sat, bb = l + (b - l) * sat;
+            p[0] = clamp8(std::floor(rr / 64.0f) * 64.0f + 32.0f);
+            p[1] = clamp8(std::floor(gg / 64.0f) * 64.0f + 32.0f);
+            p[2] = clamp8(std::floor(bb / 64.0f) * 64.0f + 32.0f);
+            break;
+        }
+        case 9:  // ice: cold blue-white
+            p[0] = clamp8(0.45f * r + 0.25f * l);
+            p[1] = clamp8(0.70f * g + 0.30f * l + 15);
+            p[2] = clamp8(0.80f * b + 0.55f * l + 40);
+            break;
+        case 10: {  // vapor: teal shadows -> pink highlights
+            float t = l / 255.0f;
+            p[0] = clamp8(255.0f * (0.10f + 0.90f * t));
+            p[1] = clamp8(255.0f * (0.85f - 0.60f * t));
+            p[2] = clamp8(255.0f * (0.90f - 0.10f * t));
+            break;
+        }
+        case 11:  // gold: warm metallic
+            p[0] = clamp8(1.10f * l + 25);
+            p[1] = clamp8(0.85f * l + 10);
+            p[2] = clamp8(0.35f * l);
+            break;
+        case 12:  // toxic: acid yellow-green
+            p[0] = clamp8(0.70f * l + 0.30f * r);
+            p[1] = clamp8(1.10f * l + 20);
+            p[2] = clamp8(0.15f * b);
             break;
         default: break;
     }
@@ -118,21 +151,39 @@ Java_com_retrolens_app_MainActivity_applyFilters(JNIEnv* env, jobject, jobject b
     }
 
     const float r2 = revealR * revealR;
-    for (int y = ys; y < ye; y++) {
-        uint8_t* row = (uint8_t*)pixels + (size_t)y * info.stride;
-        const float dy = (float)y - revealY;
-        const float dy2 = dy * dy;
-        const bool rowMayBeInside = hasQuad && y >= minY && y <= maxY;
-        for (int x = xs; x < xe; x++) {
-            int f = screenFilter;
-            if (revealOn) {
-                const float dx = (float)x - revealX;
-                if (dx * dx + dy2 > r2) f = prevFilter;
+    const size_t stride = info.stride;
+    uint8_t* base = (uint8_t*)pixels;
+    // rows are independent, so split them across a few threads
+    auto work = [&](int ya, int yb) {
+        for (int y = ya; y < yb; y++) {
+            uint8_t* row = base + (size_t)y * stride;
+            const float dy = (float)y - revealY;
+            const float dy2 = dy * dy;
+            const bool rowMayBeInside = hasQuad && y >= minY && y <= maxY;
+            for (int x = xs; x < xe; x++) {
+                int f = screenFilter;
+                if (revealOn) {
+                    const float dx = (float)x - revealX;
+                    if (dx * dx + dy2 > r2) f = prevFilter;
+                }
+                if (rowMayBeInside && x >= minX && x <= maxX && insideQuad(q, (float)x, (float)y))
+                    f = inside;
+                if (f) applyOne(row + (size_t)x * 4, f);
             }
-            if (rowMayBeInside && x >= minX && x <= maxX && insideQuad(q, (float)x, (float)y))
-                f = inside;
-            if (f) applyOne(row + (size_t)x * 4, f);
         }
+    };
+    const int rows = ye - ys;
+    if (rows < 160) {
+        work(ys, ye);
+    } else {
+        const int nT = 3;
+        std::vector<std::thread> th;
+        for (int t = 1; t < nT; t++) {
+            int a0 = ys + rows * t / nT, a1 = ys + rows * (t + 1) / nT;
+            th.emplace_back(work, a0, a1);
+        }
+        work(ys, ys + rows / nT);
+        for (auto& t : th) t.join();
     }
     AndroidBitmap_unlockPixels(env, bitmap);
 }
