@@ -94,6 +94,9 @@ private class Reveal(
     val start: Long, val dur: Long
 )
 
+/** One point of the finger-paint trail. brk = true starts a new stroke. */
+private class TrailPt(val x: Float, val y: Float, val color: Int, val brk: Boolean)
+
 private enum class SlingState { IDLE, AIMING }
 
 class MainActivity : ComponentActivity() {
@@ -106,28 +109,32 @@ class MainActivity : ComponentActivity() {
     companion object {
         init { System.loadLibrary("retrolens") }
         // filters the two-hand pinch cycles through (SEPIA removed)
-        val CYCLE = intArrayOf(1, 3, 4, 5, 6, 7)
-        val NAMES = arrayOf("NONE", "CYBER_NEON", "SEPIA", "NEGATIVE", "THERMAL", "NOIR", "MATRIX", "SUNSET")
+        val CYCLE = intArrayOf(1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+        val NAMES = arrayOf("NONE", "CYBER_NEON", "SEPIA", "NEGATIVE", "THERMAL", "NOIR", "MATRIX", "SUNSET", "COMIC", "ICE", "VAPOR", "GOLD", "TOXIC")
 
         private const val TAG = "RetroLens"
 
         // ---- gesture tuning (all in one place) ----
         private const val PINCH_ON = 0.38f          // thumb-index gap / hand size to START a pinch
         private const val PINCH_OFF = 0.58f         // gap needed to END a pinch (hysteresis = no flicker)
-        private const val POSE_CONFIRM = 3          // frames of "peace + pinch" before the sling starts
+        private const val POSE_CONFIRM = 2          // frames of "peace + pinch" before the sling starts
         private const val RELEASE_CONFIRM = 2       // frames of "pinch open" before we fire
         private const val LOST_GRACE_MS = 350L      // hands vanish while charged -> fire after this
         private const val PEACE_BROKEN_MS = 1000L   // peace sign dropped but pinch held -> cancel
         private const val PULL_MIN = 1.0f           // pull distance (in hand sizes) = 0% charge
         private const val PULL_MAX = 3.8f           // pull distance (in hand sizes) = 100% charge
         private const val MIN_FIRE_CHARGE = 0.20f   // below this the shot is cancelled
-        private const val CYCLE_HOLD_MS = 350L      // both hands pinched this long -> next filter
+        private val ZOOMS = floatArrayOf(1f, 1.5f, 2f, 3f)
+        private const val FINGER_HOLD_MS = 350L     // one-hand finger pose must be held this long
+        private const val FINGER_REPEAT_MS = 1100L
+        private const val FIST_HOLD_MS = 700L       // fist held -> photo
+        private const val CYCLE_HOLD_MS = 300L      // both hands pinched this long -> next filter
         private const val CYCLE_REPEAT_MS = 1000L
         private const val AFTER_SLING_QUIET_MS = 1200L  // ignore palm-reset / cycling right after a shot
-        private const val PALM_HOLD_MS = 500L       // open palm must be held this long to reset
+        private const val PALM_HOLD_MS = 400L       // open palm must be held this long to reset
         private const val QUAD_HOLD_MS = 150L       // keep the portal alive through a short drop-out
-        private const val EASE_TAU_MS = 30f         // drawing-side smoothing time constant
-        private const val DET_INTERVAL_MS = 33L
+        private const val EASE_TAU_MS = 12f         // drawing-side smoothing time constant
+        private const val DET_INTERVAL_MS = 16L
     }
 
     private lateinit var surfaceView: SurfaceView
@@ -189,7 +196,7 @@ class MainActivity : ComponentActivity() {
 
     // ---- result-callback thread only ----
     private var seenGen = 0
-    private val handFilters = Array(2) { Array(42) { OneEuro(1.5f, 0.02f) } }
+    private val handFilters = Array(2) { Array(42) { OneEuro(2.5f, 0.12f) } }
     private var filterCount = -1
     private val pinched = BooleanArray(2)
     private var slingState = SlingState.IDLE
@@ -209,6 +216,31 @@ class MainActivity : ComponentActivity() {
     private var bothPinchSince = 0L
     private var palmSince = 0L
     private var lastSwitch = 0L
+    @Volatile private var showLog = true
+    @Volatile private var diag = false
+    @Volatile private var detSentAt = 0L      // 0 = detector is free
+    @Volatile private var detMs = 0L
+    private var procMs = 0f
+    private var fpsFrames = 0
+    private var fpsT = 0L
+    private var trailBmp: Bitmap? = null
+    private var trailCanvas: Canvas? = null
+    private var trailDrawn = 0
+    private var seenTrailGen = 0
+    @Volatile private var trailGen = 0
+    @Volatile private var zoomIdx = 0
+    @Volatile private var party = false
+    private var dispZoom = 1f
+    private val trail = ArrayList<TrailPt>()
+    private var trailBreak = true
+    @Volatile private var penIdx = 0
+    private val PENS = intArrayOf(0, Color.WHITE, Color.rgb(255, 70, 70), Color.rgb(255, 220, 60), Color.rgb(60, 230, 255), Color.rgb(90, 255, 110))
+    private val PEN_NAMES = arrayOf("RAINBOW", "WHITE", "RED", "YELLOW", "CYAN", "GREEN")
+    private val trailPaint = Paint().apply { style = Paint.Style.STROKE; isAntiAlias = true; strokeCap = Paint.Cap.ROUND }
+    private var partyLast = 0L
+    private var gestKind = 0          // 0 none, 1 two fingers, 2 three fingers, 3 fist
+    private var gestSince = 0L
+    private var lastGestAt = 0L
     private var lastQuad: FloatArray? = null
     private var lastQuadAt = 0L
     private var hadQuad = false
@@ -259,6 +291,12 @@ class MainActivity : ComponentActivity() {
             override fun onDown(e: MotionEvent): Boolean = true
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean { requestPhoto(); return true }
             override fun onDoubleTap(e: MotionEvent): Boolean { flipCamera(); return true }
+            override fun onLongPress(e: MotionEvent) {
+                // long press: code panel -> code panel + speed info -> hidden -> ...
+                if (showLog && !diag) { diag = true; note("Speed info ON", 1200) }
+                else if (showLog) { showLog = false; diag = false }
+                else { showLog = true }
+            }
         })
         surfaceView.setOnTouchListener { _, ev -> taps.onTouchEvent(ev); true }
 
@@ -311,6 +349,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun onMpError(e: RuntimeException) {
+        detSentAt = 0L
         Log.e(TAG, "mediapipe error", e)
         if (usingGpu && !switching) {
             switching = true
@@ -382,6 +421,14 @@ class MainActivity : ComponentActivity() {
         startCamera()
     }
 
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
+        if (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP) {
+            if (event?.repeatCount == 0) requestPhoto()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     private fun requestPhoto() {
         if (Build.VERSION.SDK_INT <= 28 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
@@ -392,7 +439,7 @@ class MainActivity : ComponentActivity() {
         captureReq.set(true)
     }
 
-    @Suppress("DEPRECATION")
+    @@Suppress("DEPRECATION")
     private fun savePhoto(bmp: Bitmap) {
         try {
             val name = "RetroLens_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
@@ -502,10 +549,12 @@ class MainActivity : ComponentActivity() {
         else { r = 255; g = (255 * (1f - (c - 0.5f) / 0.5f)).toInt() }
         return Color.rgb(r.coerceIn(0, 255), g.coerceIn(0, 255), 60)
     }
-
     // ---------- drawing thread: runs on every camera frame, never waits for detection ----------
     private fun processFrame(proxy: ImageProxy) {
         try {
+            val zt = ZOOMS[zoomIdx]
+            dispZoom = if (abs(zt - dispZoom) < 0.01f) zt else dispZoom + (zt - dispZoom) * 0.2f
+            val t0 = System.nanoTime()
             val raw = grabFrame(proxy)
             val rot = proxy.imageInfo.rotationDegrees
             proxy.close()
@@ -521,6 +570,7 @@ class MainActivity : ComponentActivity() {
             xform.postTranslate(-raw.width / 2f, -raw.height / 2f)
             xform.postRotate(rot.toFloat())
             if (lensFront) xform.postScale(-1f, 1f)
+            if (dispZoom != 1f) xform.postScale(dispZoom, dispZoom)
             xform.postTranslate(ow / 2f, oh / 2f)
             c.drawBitmap(raw, xform, null)
 
@@ -535,11 +585,27 @@ class MainActivity : ComponentActivity() {
             val nowMs = System.currentTimeMillis()
             val dt = (nowMs - lastDrawMs).coerceIn(1L, 100L)
             lastDrawMs = nowMs
+            fpsFrames++
+            if (nowMs - fpsT >= 2000L) {
+                if (diag && fpsT != 0L) {
+                    logEv("C++", "fps=${fpsFrames * 1000L / (nowMs - fpsT)} draw=${procMs.toInt()}ms detect=${detMs}ms ${if (usingGpu) "GPU" else "CPU"}")
+                }
+                fpsFrames = 0; fpsT = nowMs
+            }
+            // party mode: the screen filter changes by itself every 2.5 seconds
+            if (party && nowMs - partyLast > 2500L) {
+                partyLast = nowMs
+                val prevF = screenFilter
+                val nextF = CYCLE[(CYCLE.indexOf(prevF) + 1) % CYCLE.size]
+                screenFilter = nextF
+                startReveal(prevF, nextF, PointF(w / 2f, h / 2f), 0.5f, nowMs)
+            }
             val ek = 1f - exp(-dt.toFloat() / EASE_TAU_MS)
 
             // hand the frame to MediaPipe (it runs in the background and skips frames if busy)
             val lm = landmarker
-            if (lm != null && !switching && nowMs - lastDetSent >= DET_INTERVAL_MS) {
+            if (lm != null && !switching && (detSentAt == 0L || nowMs - detSentAt > 250L)) {
+                detSentAt = nowMs
                 lastDetSent = nowMs
                 val dw = bmp.width / 2
                 val dh = bmp.height / 2
@@ -550,6 +616,7 @@ class MainActivity : ComponentActivity() {
                 try {
                     lm.detectAsync(BitmapImageBuilder(db).build(), nextTs())
                 } catch (t: Throwable) {
+                    detSentAt = 0L
                     Log.e(TAG, "detectAsync failed", t)
                     if (usingGpu && !switching) {
                         switching = true
@@ -585,6 +652,38 @@ class MainActivity : ComponentActivity() {
             }
 
             applyFilters(bmp, screenFilter, portalFilter, dispQuad, rvPrev, rvX, rvY, rvR)
+
+            // finger drawing: lines are painted once into their own layer, then the layer is stamped each frame
+            run {
+                var tb = trailBmp
+                if (tb == null || tb.width != bmp.width || tb.height != bmp.height) {
+                    tb = Bitmap.createBitmap(bmp.width, bmp.height, Bitmap.Config.ARGB_8888)
+                    trailBmp = tb; trailCanvas = Canvas(tb); trailDrawn = 0; seenTrailGen = -1
+                }
+                val tc = trailCanvas!!
+                var from = trailDrawn
+                if (seenTrailGen != trailGen) {
+                    seenTrailGen = trailGen
+                    tc.drawColor(0, PorterDuff.Mode.CLEAR)
+                    from = 0
+                }
+                val start = max(from - 1, 0)
+                var total = 0
+                val pts: List<TrailPt> = synchronized(trail) {
+                    total = trail.size
+                    if (start < total) ArrayList(trail.subList(start, total)) else ArrayList()
+                }
+                trailPaint.strokeWidth = 9f * k
+                trailPaint.alpha = 255
+                for (i in 1 until pts.size) {
+                    val q = pts[i]; val o = pts[i - 1]
+                    if (q.brk) continue
+                    trailPaint.color = if (q.color == 0) Color.HSVToColor(floatArrayOf(((start + i) * 3 % 360).toFloat(), 0.85f, 1f)) else q.color
+                    tc.drawLine(o.x, o.y, q.x, q.y, trailPaint)
+                }
+                trailDrawn = total
+                if (total > 0 || from > 0) c.drawBitmap(tb, 0f, 0f, null)
+            }
 
             // photo: grab the filtered picture BEFORE any HUD is drawn on it
             if (captureReq.getAndSet(false)) {
@@ -655,13 +754,12 @@ class MainActivity : ComponentActivity() {
                     c.drawCircle(dd[i * 4 + 2], dd[i * 4 + 3], 9f * k, dot)
                 }
             }
-
             // code log panel at the bottom: what the app is doing right now
             val base = minOf(w, h) * 0.037f
             val lh = base * 1.5f
             val panelTop = h - (lh * 4f + 10f)
-            c.drawRect(0f, panelTop, w, h, panelBg)
-            val snapLog = synchronized(logLines) { ArrayList(logLines) }
+            if (showLog) c.drawRect(0f, panelTop, w, h, panelBg)
+            val snapLog = synchronized(logLines) { ArrayList(logLines) }.also { if (!showLog) it.clear() }
             snapLog.forEachIndexed { i, entry ->
                 val prefix = if (entry.first == "C#") "C#  " else "C++ "
                 // measure at the base size first, then shrink to fit
@@ -678,6 +776,8 @@ class MainActivity : ComponentActivity() {
             }
 
             if (System.currentTimeMillis() < msgUntil) drawFit(c, msg, 20f * k, panelTop - 16f * k, text, w - 40f * k)
+
+            procMs += ((System.nanoTime() - t0) / 1e6f - procMs) * 0.1f
 
             // draw straight onto the screen surface (no hop through the UI thread)
             if (surfaceOk) {
@@ -711,7 +811,7 @@ class MainActivity : ComponentActivity() {
     private fun resetGestureState() {
         slingState = SlingState.IDLE
         poseFrames = 0; releaseFrames = 0; peaceBrokenSince = 0L
-        bothPinchSince = 0L; palmSince = 0L
+        bothPinchSince = 0L; palmSince = 0L; gestKind = 0; gestSince = 0L
         pinched.fill(false)
         chargeHist.fill(0f)
         lastAim = null; lastCharge = 0f
@@ -771,8 +871,9 @@ class MainActivity : ComponentActivity() {
             logEv("C#", "Sling.Cancel(); // charge ${(peak * 100).toInt()}% < ${(MIN_FIRE_CHARGE * 100).toInt()}%")
         }
     }
-
     private fun onResult(result: HandLandmarkerResult) {
+        val sent = detSentAt
+        if (sent != 0L) { detMs = System.currentTimeMillis() - sent; detSentAt = 0L }
         try {
             val w = frameW; val h = frameH
             if (w == 0f || h == 0f) return
@@ -875,6 +976,21 @@ class MainActivity : ComponentActivity() {
                             note("PORTAL: ${NAMES[portalFilter]}", 1000)
                             logEv("C#", "Portal.Filter = ${NAMES[portalFilter]};")
                         }
+                          } else if (hands.size == 2) {
+                    palmSince = 0L
+                    val a = hands[0]; val b = hands[1]
+                    if (pinched[0] && pinched[1]) {
+                        // both hands pinching -> next portal filter (must be HELD, so it can't trigger by accident)
+                        val ma = mid(a[4], a[8]); val mb = mid(b[4], b[8])
+                        link = floatArrayOf(ma.x, ma.y, mb.x, mb.y)
+                        if (bothPinchSince == 0L) bothPinchSince = now
+                        if (now - bothPinchSince > CYCLE_HOLD_MS && now - lastSwitch > CYCLE_REPEAT_MS &&
+                            now - slingEndedAt > AFTER_SLING_QUIET_MS) {
+                            lastSwitch = now
+                            portalFilter = CYCLE[(CYCLE.indexOf(portalFilter) + 1) % CYCLE.size]
+                            note("PORTAL: ${NAMES[portalFilter]}", 1000)
+                            logEv("C#", "Portal.Filter = ${NAMES[portalFilter]};")
+                        }
                     } else {
                         bothPinchSince = 0L
                         // portal = frame made by both hands (thumb + index tips)
@@ -883,19 +999,75 @@ class MainActivity : ComponentActivity() {
                 } else {
                     bothPinchSince = 0L
                     // one open palm, held, resets the screen filter
-                    if (hands.size == 1 && isOpenPalm(hands[0]) && screenFilter != 0 &&
+                    if (hands.size == 1 && isOpenPalm(hands[0]) && (screenFilter != 0 || trail.isNotEmpty()) &&
                         now - slingEndedAt > AFTER_SLING_QUIET_MS) {
                         if (palmSince == 0L) palmSince = now
                         if (now - palmSince > PALM_HOLD_MS) {
                             val prev = screenFilter
-                            screenFilter = 0
                             palmSince = 0L
-                            startReveal(prev, 0, hands[0][9], 0.5f, now)
-                            note("RESET - screen filter off", 1200)
-                            logEv("C#", "Screen.Filter = NONE; // palm reset")
+                            synchronized(trail) { trail.clear(); trailGen++ }
+                            trailBreak = true
+                            if (prev != 0) {
+                                screenFilter = 0
+                                startReveal(prev, 0, hands[0][9], 0.5f, now)
+                            }
+                            note("CLEARED - drawing and filter reset", 1200)
+                            logEv("C#", "Canvas.Clear(); Screen.Filter = NONE; // palm")
                         }
                     } else {
                         palmSince = 0L
+                    }
+
+                    // ---- one-hand finger gestures ----
+                    // 2 fingers = next screen filter, 3 fingers = previous, fist = photo, 5 fingers = reset (above)
+                    val kind = if (hands.size == 1 && now - slingEndedAt > AFTER_SLING_QUIET_MS) fingerPose(hands[0]) else 0
+                    if (kind != gestKind) { gestKind = kind; gestSince = now }
+                    if (kind == 4) { addTrail(hands[0][8], now) } else trailBreak = true
+                    if (kind != 0 && kind != 4 && gestSince != 0L) {
+                        val need = when (kind) { 3 -> FIST_HOLD_MS; 8 -> 1000L; 7 -> 700L; 9 -> 500L; 5, 6 -> 600L; else -> FINGER_HOLD_MS }
+                        if (now - gestSince > need && now - lastGestAt > (when (kind) { 3 -> 2000L; 7, 8 -> 2500L; 9 -> 900L; 5, 6 -> 900L; else -> FINGER_REPEAT_MS })) {
+                            lastGestAt = now
+                            when (kind) {
+                                1, 2 -> {
+                                    val list = intArrayOf(0) + CYCLE
+                                    val i = list.indexOf(screenFilter).let { if (it < 0) 0 else it }
+                                    val step = if (kind == 1) 1 else list.size - 1
+                                    val prev = screenFilter
+                                    screenFilter = list[(i + step) % list.size]
+                                    startReveal(prev, screenFilter, hands[0][9], 0.4f, now)
+                                    note(if (kind == 1) "2 FINGERS - ${NAMES[screenFilter]}" else "3 FINGERS - ${NAMES[screenFilter]}", 1000)
+                                    logEv("C#", "Screen.Filter = ${NAMES[screenFilter]}; // ${if (kind == 1) "next" else "prev"}")
+                                }
+                                5, 6 -> {
+                                    val ni = (zoomIdx + (if (kind == 5) 1 else -1)).coerceIn(0, ZOOMS.size - 1)
+                                    if (ni != zoomIdx) {
+                                        zoomIdx = ni
+                                        note(if (kind == 5) "THUMBS UP - zoom ${ZOOMS[ni]}x" else "THUMBS DOWN - zoom ${ZOOMS[ni]}x", 1000)
+                                        logEv("C#", "Camera.Zoom = ${ZOOMS[ni]}f;")
+                                    }
+                                }
+                                7 -> {
+                                    party = !party
+                                    partyLast = now
+                                    note(if (party) "PARTY MODE ON" else "PARTY MODE OFF", 1200)
+                                    logEv("C#", "Party.Enabled = $party; // shaka")
+                                }
+                                9 -> {
+                                    penIdx = (penIdx + 1) % PENS.size
+                                    note("PEN: ${PEN_NAMES[penIdx]}", 1000)
+                                    logEv("C#", "Pen.Color = ${PEN_NAMES[penIdx]};")
+                                }
+                                8 -> {
+                                    runOnUiThread { flipCamera() }
+                                    logEv("C#", "Camera.Flip(); // pinky")
+                                }
+                                3 -> {
+                                    runOnUiThread { requestPhoto() }
+                                    note("FIST - photo!", 1000)
+                                    logEv("C#", "Camera.Capture(); // fist")
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -919,9 +1091,8 @@ class MainActivity : ComponentActivity() {
         } catch (e: Throwable) {
             Log.e(TAG, "result error", e)
         }
-    }
-
-    private fun note(s: String, ms: Long) { msg = s; msgUntil = System.currentTimeMillis() + ms }
+        }
+        private fun note(s: String, ms: Long) { msg = s; msgUntil = System.currentTimeMillis() + ms }
 
     // ---- gesture helpers (landmark indices from MediaPipe Hands) ----
     private fun d(a: PointF, b: PointF) = hypot(a.x - b.x, a.y - b.y)
@@ -931,8 +1102,32 @@ class MainActivity : ComponentActivity() {
     private fun up(h: List<PointF>, tip: Int, pip: Int, k: Float = 1.15f) = d(h[0], h[tip]) > d(h[0], h[pip]) * k
     private fun isPeace(h: List<PointF>) = up(h, 8, 6, 1.1f) && up(h, 12, 10, 1.1f) && !up(h, 16, 14, 1.25f) && !up(h, 20, 18, 1.25f)
     private fun isPeaceLoose(h: List<PointF>) = up(h, 8, 6, 1.0f) && up(h, 12, 10, 1.0f)
+    /** 1 = two fingers (peace), 2 = three fingers, 3 = fist, 4 = one finger (point = draw), 9 = L shape (pen color), 8 = pinky only (flip), 0 = anything else. Thumb is ignored. */
+    private fun thumbOut(h: List<PointF>) = d(h[4], h[5]) > size(h) * 0.75f
+    private fun addTrail(p: PointF, now: Long) {
+        synchronized(trail) {
+            trail.add(TrailPt(p.x, p.y, PENS[penIdx], trailBreak))
+            if (trail.size > 6000) { trail.subList(0, 500).clear(); trailGen++ }
+        }
+        trailBreak = false
+    }
+    private fun fingerPose(h: List<PointF>): Int {
+        val i = up(h, 8, 6, 1.1f); val m = up(h, 12, 10, 1.1f)
+        val r = up(h, 16, 14, 1.1f); val p = up(h, 20, 18, 1.1f)
+        return when {
+            i && m && !r && !p -> 1
+            i && m && r && !p -> 2
+            i && !m && !r && !p -> if (d(h[4], h[5]) > size(h) * 0.95f) 9 else 4
+            !i && !m && !r && p && !thumbOut(h) -> 8
+            !i && !m && !r && p && thumbOut(h) -> 7
+            !i && !m && !r && !p -> when {
+                !thumbOut(h) -> 3
+                h[4].y < h[0].y - size(h) * 0.6f -> 5
+                h[4].y > h[0].y + size(h) * 0.6f -> 6
+                else -> 0
+            }
+            else -> 0
+        }
+    }
     private fun isOpenPalm(h: List<PointF>) = up(h, 8, 6) && up(h, 12, 10) && up(h, 16, 14) && up(h, 20, 18)
 }
-
-    
-            
