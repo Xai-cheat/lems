@@ -1,7 +1,7 @@
 // RetroLens native filters (C++ / NDK)
 // Filter ids: 0 = none, 1 = CYBER_NEON, 2 = SEPIA, 3 = NEGATIVE,
 //               4 = THERMAL, 5 = NOIR, 6 = MATRIX, 7 = SUNSET,
-//               8 = COMIC, 9 = ICE, 10 = VAPOR, 11 = GOLD, 12 = TOXIC
+//               8 = COMIC, 9 = ICE, 10 = VAPOR, 11 = GOLD, 12 = TOXIC, 13 = NIGHT, 14 = FILM
 #include <jni.h>
 #include <android/bitmap.h>
 #include <algorithm>
@@ -86,6 +86,18 @@ static inline void applyOne(uint8_t* p, int f) {
             p[1] = clamp8(1.10f * l + 20);
             p[2] = clamp8(0.15f * b);
             break;
+        case 13: {  // night vision: brighten the dark, green phosphor
+            float g2 = 255.0f * std::sqrt(l / 255.0f);
+            p[0] = clamp8(0.18f * g2);
+            p[1] = clamp8(g2 + 8);
+            p[2] = clamp8(0.25f * g2);
+            break;
+        }
+        case 14:  // film: faded blacks, warm tint, softer contrast
+            p[0] = clamp8((0.90f * r + 0.10f * g) * 0.85f + 34);
+            p[1] = clamp8((0.88f * g + 0.06f * b) * 0.85f + 26);
+            p[2] = clamp8((0.72f * b + 0.10f * r) * 0.85f + 30);
+            break;
         default: break;
     }
 }
@@ -112,7 +124,8 @@ Java_com_retrolens_app_MainActivity_applyFilters(JNIEnv* env, jobject, jobject b
                                                  jint screenFilter, jint portalFilter,
                                                  jfloatArray quadArr,
                                                  jint prevFilter, jfloat revealX, jfloat revealY,
-                                                 jfloat revealR) {
+                                                 jfloat revealR,
+                                                 jint portalPrev, jfloat portalMix) {
     AndroidBitmapInfo info;
     if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) return;
     if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return;
@@ -126,6 +139,10 @@ Java_com_retrolens_app_MainActivity_applyFilters(JNIEnv* env, jobject, jobject b
     // Inside the portal: show the portal filter, or the clean image if it
     // matches the screen filter (this gives the "portal" inversion effect).
     const int inside = (portalFilter == screenFilter) ? 0 : portalFilter;
+    // right after the portal filter changes, fade from the old one to the new one
+    const bool mixOn = hasQuad && portalPrev >= 0 && portalMix < 0.999f;
+    const int prevInside = (portalPrev == screenFilter) ? 0 : portalPrev;
+    const float mixT = portalMix < 0.0f ? 0.0f : (portalMix > 1.0f ? 1.0f : portalMix);
 
     if (!hasQuad && screenFilter == 0 && outsideFilter == 0) return;  // nothing to draw
 
@@ -166,8 +183,18 @@ Java_com_retrolens_app_MainActivity_applyFilters(JNIEnv* env, jobject, jobject b
                     const float dx = (float)x - revealX;
                     if (dx * dx + dy2 > r2) f = prevFilter;
                 }
-                if (rowMayBeInside && x >= minX && x <= maxX && insideQuad(q, (float)x, (float)y))
+                if (rowMayBeInside && x >= minX && x <= maxX && insideQuad(q, (float)x, (float)y)) {
+                    if (mixOn) {
+                        uint8_t* px = row + (size_t)x * 4;
+                        uint8_t b[4] = {px[0], px[1], px[2], px[3]};
+                        if (prevInside) applyOne(b, prevInside);
+                        if (inside) applyOne(px, inside);
+                        for (int ch = 0; ch < 3; ch++)
+                            px[ch] = (uint8_t)((float)b[ch] + ((float)px[ch] - (float)b[ch]) * mixT);
+                        continue;
+                    }
                     f = inside;
+                }
                 if (f) applyOne(row + (size_t)x * 4, f);
             }
         }
