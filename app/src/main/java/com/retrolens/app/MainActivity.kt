@@ -1,13 +1,16 @@
 package com.retrolens.app
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.*
+import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.util.Log
 import android.util.Size
 import android.widget.FrameLayout
-import android.widget.ImageView
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -30,14 +33,27 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         init { System.loadLibrary("retrolens") }
+        // filters the two-hand pinch cycles through (SEPIA removed)
+        val CYCLE = intArrayOf(1, 3, 4, 5, 6, 7)
         val NAMES = arrayOf("NONE", "CYBER_NEON", "SEPIA", "NEGATIVE", "THERMAL", "NOIR", "MATRIX", "SUNSET")
     }
 
-    private lateinit var imageView: ImageView
+    private lateinit var surfaceView: SurfaceView
+    @Volatile private var surfaceOk = false
+    private val blit = Paint().apply { isFilterBitmap = true }
+    private val dst = RectF()
     @Volatile private var landmarker: HandLandmarker? = null
     @Volatile private var usingGpu = false
     @Volatile private var switching = false
     private var errView: TextView? = null
+    private var analysisUse: ImageAnalysis? = null
+    private var rawBuf: Bitmap? = null
+    private var listenerOn = false
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) { updateRotation() }
+    }
 
     private val exec = Executors.newSingleThreadExecutor()   // camera frames -> drawing
 
@@ -101,9 +117,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        imageView = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setBackgroundColor(Color.BLACK) }
+        surfaceView = SurfaceView(this)
+        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) { surfaceOk = true }
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+            override fun surfaceDestroyed(holder: SurfaceHolder) { surfaceOk = false }
+        })
         val root = FrameLayout(this)
-        root.addView(imageView)
+        root.addView(surfaceView)
         errView = TextView(this).apply { setTextColor(Color.RED); textSize = 13f; setPadding(20, 140, 20, 0) }
         root.addView(errView)
         setContentView(root)
@@ -184,9 +205,43 @@ class MainActivity : ComponentActivity() {
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
             analysis.setAnalyzer(exec) { proxy -> processFrame(proxy) }
+            analysisUse = analysis
+            if (!listenerOn) {
+                listenerOn = true
+                (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager).registerDisplayListener(displayListener, null)
+            }
             provider.unbindAll()
             provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    @Suppress("DEPRECATION")
+    private fun updateRotation() {
+        analysisUse?.targetRotation = windowManager.defaultDisplay.rotation
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (listenerOn) {
+            listenerOn = false
+            (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(displayListener)
+        }
+    }
+
+    // copy the camera pixels into a reused bitmap (no new 1MB bitmap every frame)
+    private fun grabFrame(proxy: ImageProxy): Bitmap {
+        val iw = proxy.width
+        val ih = proxy.height
+        val plane = proxy.planes[0]
+        val buf = plane.buffer
+        if (plane.pixelStride == 4 && plane.rowStride == iw * 4 && buf.remaining() >= iw * ih * 4) {
+            val rb = rawBuf?.takeIf { it.width == iw && it.height == ih }
+                ?: Bitmap.createBitmap(iw, ih, Bitmap.Config.ARGB_8888).also { rawBuf = it }
+            buf.rewind()
+            rb.copyPixelsFromBuffer(buf)
+            return rb
+        }
+        return proxy.toBitmap()
     }
 
     private fun nextBuffer(w: Int, h: Int): Bitmap {
@@ -217,7 +272,7 @@ class MainActivity : ComponentActivity() {
     // ---------- drawing thread: runs on every camera frame, never waits for detection ----------
     private fun processFrame(proxy: ImageProxy) {
         try {
-            val raw = proxy.toBitmap()
+            val raw = grabFrame(proxy)
             val rot = proxy.imageInfo.rotationDegrees
             proxy.close()
 
@@ -237,6 +292,10 @@ class MainActivity : ComponentActivity() {
             c.drawBitmap(raw, m, null)
 
             val w = bmp.width.toFloat(); val h = bmp.height.toFloat()
+            if (w != frameW || h != frameH) {
+                dispQuad = null; dispLine = null; dispDots = null
+                quad = null; line = null; handsPx = emptyList(); prevQuad = null
+            }
             frameW = w; frameH = h
 
             // hand the frame to MediaPipe (it runs in the background and skips frames if busy)
@@ -268,8 +327,6 @@ class MainActivity : ComponentActivity() {
             q?.let {
                 val p = Path().apply { moveTo(it[0], it[1]); lineTo(it[2], it[3]); lineTo(it[4], it[5]); lineTo(it[6], it[7]); close() }
                 c.drawPath(p, green)
-                val lx = it[2].coerceIn(4f, w * 0.55f)
-                drawFit(c, "PORTAL: ${NAMES[portalFilter]}", lx, minOf(it[3], it[5]) - 20, text, w - lx - 4f)
             }
             ln?.let { c.drawLine(it[0], it[1], it[2], it[3], green) }
 
@@ -298,7 +355,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // code log panel at the bottom: what the app is doing right now
-            val base = w * 0.037f
+            val base = minOf(w, h) * 0.037f
             val lh = base * 1.5f
             val panelTop = h - (lh * 4f + 10f)
             c.drawRect(0f, panelTop, w, h, panelBg)
@@ -320,7 +377,25 @@ class MainActivity : ComponentActivity() {
 
             if (System.currentTimeMillis() < msgUntil) drawFit(c, msg, 20f, panelTop - 16f, text, w - 40f)
 
-            runOnUiThread { imageView.setImageBitmap(bmp) }
+            // draw straight onto the screen surface (no hop through the UI thread)
+            if (surfaceOk) {
+                val sh = surfaceView.holder
+                val sc = try { sh.lockHardwareCanvas() } catch (t: Throwable) { sh.lockCanvas() }
+                if (sc != null) {
+                    try {
+                        sc.drawColor(Color.BLACK)
+                        val vw = sc.width.toFloat()
+                        val vh = sc.height.toFloat()
+                        val sf = minOf(vw / w, vh / h)
+                        val dw = w * sf
+                        val dh = h * sf
+                        dst.set((vw - dw) / 2f, (vh - dh) / 2f, (vw + dw) / 2f, (vh + dh) / 2f)
+                        sc.drawBitmap(bmp, null, dst, blit)
+                    } finally {
+                        sh.unlockCanvasAndPost(sc)
+                    }
+                }
+            }
         } catch (e: Throwable) {
             runCatching { proxy.close() }
             Log.e("RetroLens", "frame error", e)
@@ -377,12 +452,12 @@ class MainActivity : ComponentActivity() {
                     lastSlingAt = now
                     lastSlingLine = newLine
                     lastCharge = newCharge
-                    note("KETAPEL - LEPAS UNTUK TEMBAK!", 400)
+                    note("Charging - Charging", 400)
                 } else if (isPinch(a) && isPinch(b)) {
                     newLine = Pair(mid(a[4], a[8]), mid(b[4], b[8]))
                     if (now - lastSwitch > 1000) {
                         lastSwitch = now
-                        portalFilter = portalFilter % (NAMES.size - 1) + 1
+                        portalFilter = CYCLE[(CYCLE.indexOf(portalFilter) + 1) % CYCLE.size]
                         note("PORTAL: ${NAMES[portalFilter]}", 1000)
                         logEv("C#", "Portal.Filter = ${NAMES[portalFilter]};")
                     }
@@ -427,7 +502,6 @@ class MainActivity : ComponentActivity() {
             Log.e("RetroLens", "result error", e)
         }
     }
-
     private fun note(s: String, ms: Long) { msg = s; msgUntil = System.currentTimeMillis() + ms }
 
     // ---- gesture helpers (landmark indices from MediaPipe Hands) ----
