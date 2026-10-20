@@ -256,9 +256,9 @@ class MainActivity : ComponentActivity() {
 
         // tap = photo, double tap = flip camera
         val taps = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-            override fun onDown(e: MotionEvent?): Boolean = true
-            override fun onSingleTapConfirmed(e: MotionEvent?): Boolean { requestPhoto(); return true }
-            override fun onDoubleTap(e: MotionEvent?): Boolean { flipCamera(); return true }
+            override fun onDown(e: MotionEvent): Boolean = true
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean { requestPhoto(); return true }
+            override fun onDoubleTap(e: MotionEvent): Boolean { flipCamera(); return true }
         })
         surfaceView.setOnTouchListener { _, ev -> taps.onTouchEvent(ev); true }
 
@@ -445,7 +445,7 @@ class MainActivity : ComponentActivity() {
         ioExec.shutdown()
     }
 
-        // copy the camera pixels into a reused bitmap (no new 1MB bitmap every frame)
+    // copy the camera pixels into a reused bitmap (no new 1MB bitmap every frame)
     private fun grabFrame(proxy: ImageProxy): Bitmap {
         val iw = proxy.width
         val ih = proxy.height
@@ -557,7 +557,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
-
             // glide the overlay toward the newest detection (frame-rate independent)
             val ov = overlay
             dispQuad = easeTo(dispQuad, ov?.quad, ek)
@@ -740,7 +739,6 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-
     private fun startReveal(from: Int, to: Int, origin: PointF, power: Float, now: Long) {
         val dur = (700f - 300f * power).toLong()
         reveal = Reveal(from, to, origin.x, origin.y, now, dur)
@@ -935,3 +933,6 @@ class MainActivity : ComponentActivity() {
     private fun isPeaceLoose(h: List<PointF>) = up(h, 8, 6, 1.0f) && up(h, 12, 10, 1.0f)
     private fun isOpenPalm(h: List<PointF>) = up(h, 8, 6) && up(h, 12, 10) && up(h, 16, 14) && up(h, 20, 18)
 }
+
+    
+            
