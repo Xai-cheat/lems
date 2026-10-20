@@ -68,50 +68,70 @@ static bool insideQuad(const float* q, float x, float y) {
     return pos == 0 || neg == 0;
 }
 
+// Layers, from bottom to top:
+//   1. the whole screen        -> screenFilter
+//   2. shockwave reveal        -> pixels OUTSIDE the circle (revealX, revealY, revealR)
+//                                 still show prevFilter (the filter before the slingshot shot)
+//   3. the portal quad         -> portalFilter (or the clean image if it equals the screen filter)
+// Pass revealR < 0 (or prevFilter < 0) to disable the reveal.
 extern "C" JNIEXPORT void JNICALL
 Java_com_retrolens_app_MainActivity_applyFilters(JNIEnv* env, jobject, jobject bitmap,
                                                  jint screenFilter, jint portalFilter,
-                                                 jfloatArray quadArr) {
+                                                 jfloatArray quadArr,
+                                                 jint prevFilter, jfloat revealX, jfloat revealY,
+                                                 jfloat revealR) {
     AndroidBitmapInfo info;
     if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) return;
     if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return;
 
+    float q[8];
+    bool hasQuad = quadArr != nullptr && env->GetArrayLength(quadArr) >= 8;
+    if (hasQuad) env->GetFloatArrayRegion(quadArr, 0, 8, q);
+
+    const bool revealOn = revealR >= 0.0f && prevFilter >= 0;
+    const int outsideFilter = revealOn ? prevFilter : screenFilter;
+    // Inside the portal: show the portal filter, or the clean image if it
+    // matches the screen filter (this gives the "portal" inversion effect).
+    const int inside = (portalFilter == screenFilter) ? 0 : portalFilter;
+
+    if (!hasQuad && screenFilter == 0 && outsideFilter == 0) return;  // nothing to draw
+
     void* pixels = nullptr;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS) return;
 
-    float q[8];
-    bool hasQuad = quadArr != nullptr;
-    if (hasQuad) env->GetFloatArrayRegion(quadArr, 0, 8, q);
-
-    int minX = 0, maxX = (int)info.width - 1, minY = 0, maxY = (int)info.height - 1;
+    const int W = (int)info.width, H = (int)info.height;
+    int minX = 0, maxX = W - 1, minY = 0, maxY = H - 1;
     if (hasQuad) {
         float x0 = q[0], x1 = q[0], y0 = q[1], y1 = q[1];
         for (int i = 1; i < 4; i++) {
             x0 = std::min(x0, q[i * 2]); x1 = std::max(x1, q[i * 2]);
             y0 = std::min(y0, q[i * 2 + 1]); y1 = std::max(y1, q[i * 2 + 1]);
         }
-        minX = std::max(0, (int)x0); maxX = std::min((int)info.width - 1, (int)x1);
-        minY = std::max(0, (int)y0); maxY = std::min((int)info.height - 1, (int)y1);
+        minX = std::max(0, (int)x0); maxX = std::min(W - 1, (int)x1);
+        minY = std::max(0, (int)y0); maxY = std::min(H - 1, (int)y1);
     }
-    // Inside the portal: show the portal filter, or the clean image if it
-    // matches the screen filter (this gives the "portal" inversion effect).
-    int inside = (portalFilter == screenFilter) ? 0 : portalFilter;
 
-    if (screenFilter == 0 && !hasQuad) { AndroidBitmap_unlockPixels(env, bitmap); return; }
-    uint32_t y0i = 0, y1i = info.height, x0i = 0, x1i = info.width;
-    if (screenFilter == 0 && hasQuad) {  // nothing outside the portal to do
+    int ys = 0, ye = H, xs = 0, xe = W;
+    if (!revealOn && screenFilter == 0 && hasQuad) {  // only the portal needs work
         if (maxX < minX || maxY < minY) { AndroidBitmap_unlockPixels(env, bitmap); return; }
-        y0i = (uint32_t)minY; y1i = (uint32_t)maxY + 1; x0i = (uint32_t)minX; x1i = (uint32_t)maxX + 1;
+        ys = minY; ye = maxY + 1; xs = minX; xe = maxX + 1;
     }
 
-    for (uint32_t y = y0i; y < y1i; y++) {
-        uint8_t* row = (uint8_t*)pixels + y * info.stride;
-        for (uint32_t x = x0i; x < x1i; x++) {
+    const float r2 = revealR * revealR;
+    for (int y = ys; y < ye; y++) {
+        uint8_t* row = (uint8_t*)pixels + (size_t)y * info.stride;
+        const float dy = (float)y - revealY;
+        const float dy2 = dy * dy;
+        const bool rowMayBeInside = hasQuad && y >= minY && y <= maxY;
+        for (int x = xs; x < xe; x++) {
             int f = screenFilter;
-            if (hasQuad && (int)x >= minX && (int)x <= maxX && (int)y >= minY && (int)y <= maxY &&
-                insideQuad(q, (float)x, (float)y))
+            if (revealOn) {
+                const float dx = (float)x - revealX;
+                if (dx * dx + dy2 > r2) f = prevFilter;
+            }
+            if (rowMayBeInside && x >= minX && x <= maxX && insideQuad(q, (float)x, (float)y))
                 f = inside;
-            if (f) applyOne(row + x * 4, f);
+            if (f) applyOne(row + (size_t)x * 4, f);
         }
     }
     AndroidBitmap_unlockPixels(env, bitmap);
