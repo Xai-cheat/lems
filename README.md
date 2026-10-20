@@ -7,4 +7,3 @@ Gestures
 - Left hand peace + right hand pinch, then release -> "ketapel": whole screen takes the portal filter
 - One open palm -> reset
 
-Build: push to GitHub, open Actions, run "Build RetroLens APK", download the APK from Artifacts.
